@@ -23,9 +23,9 @@ cd tests
 sudo docker build --tag ssh-git-test -f ssh.Dockerfile .
 ```
 
-Run the docker ssh server with hardcoded keys:
+Run the docker ssh server with hardcoded keys (Stop with Ctrl+C):
 ```
-sudo docker run -p 2222:22 ssh-git-test
+sudo docker run -p 2222:22 --init ssh-git-test
 ```
 
 Make a local repository and configure the remote:

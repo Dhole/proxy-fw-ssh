@@ -162,6 +162,22 @@ impl client::Handler for Handler {
             .unwrap();
         Ok(())
     }
+
+    async fn exit_status(
+        &mut self,
+        channel: ChannelId,
+        exit_status: u32,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        info!("DBG outbound server exit_status: {}", exit_status);
+        let inbound_channel_id = self.inbound_chan_id_get(channel);
+        self.inbound_handle()
+            .await
+            .exit_status_request(inbound_channel_id, exit_status)
+            .await
+            .unwrap();
+        Ok(())
+    }
 }
 
 impl server::Handler for Handler {
