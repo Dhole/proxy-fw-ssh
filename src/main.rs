@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::fs;
+use std::ops::Deref;
 use std::sync::Arc;
 
 // use anyhow::Context;
@@ -11,6 +13,7 @@ use russh::server::{self, run_stream, Server as _};
 use russh::{Channel, ChannelId, Preferred};
 use ssh_key::private::{Ed25519Keypair, KeypairData};
 use std::time::Duration;
+use structopt::StructOpt;
 use tokio::net::{self, TcpListener};
 // use tokio::sync::Mutex;
 use std::collections::HashMap;
@@ -20,44 +23,95 @@ use fast_socks5::server::ErrorContext;
 use fast_socks5::server::{states, SocksServerError};
 use fast_socks5::util::stream::tcp_connect_with_timeout;
 use fast_socks5::util::target_addr::{AddrError, TargetAddr};
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as StdToSocketAddrs};
+use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{
     MappedMutexGuard, Mutex, MutexGuard, OnceCell, RwLock, RwLockReadGuard, SetOnce,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
+    inbound_server_address: String,
+    inbound_server_identity_file: PathBuf,
+    outbound_client_identity_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientRule {
+    name: Option<String>,
+    servers: HashMap<String, ServerRule>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ServerRule {
+    git: GitServerRule,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GitServerRule {
+    #[serde(flatten)]
+    paths: HashMap<String, AccessRule>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+enum AccessRule {
+    #[default]
+    #[serde(rename = "")]
+    None,
+    #[serde(rename = "r")]
+    Read,
+    #[serde(rename = "rw")]
+    ReadWrite,
+}
+
+#[derive(Clone)]
+struct SshConfig {
     ssh_server: Arc<russh::server::Config>,
     ssh_client: Arc<russh::client::Config>,
-    outbound_client_key: Arc<PrivateKey>,
+    outbound_client_key: PrivateKey,
+}
+
+struct SessionState {
+    outbound_server_addr: TargetAddr,
+    outbound_client_key: PrivateKey,
+    inbound_client_pub_key: SetOnce<(String, ssh_key::PublicKey)>,
+    // Requires mut
+    outbound_session: SetOnce<Mutex<russh::client::Handle<Handler>>>,
+    inbound_session: SetOnce<russh::server::Handle>,
+    // inbound_outbound_chan_id_map: Arc<RwLock<Vec<Option<ChannelId>>>>,
+    // outbound_inbound_chan_id_map: Arc<RwLock<Vec<Option<ChannelId>>>>,
+    outbound_inbound_chan_id_map: DashMap<u32, ChannelId>,
+    inbound_outbound_chan_map: DashMap<u32, Channel<client::Msg>>,
 }
 
 #[derive(Clone)]
-struct Handler {
-    outbound_client_key: Arc<PrivateKey>,
-    // Requires mut
-    outbound_session: Arc<SetOnce<Mutex<russh::client::Handle<Self>>>>,
-    inbound_session: Arc<SetOnce<russh::server::Handle>>,
-    // inbound_outbound_chan_id_map: Arc<RwLock<Vec<Option<ChannelId>>>>,
-    // outbound_inbound_chan_id_map: Arc<RwLock<Vec<Option<ChannelId>>>>,
-    outbound_inbound_chan_id_map: Arc<DashMap<u32, ChannelId>>,
-    inbound_outbound_chan_map: Arc<DashMap<u32, Channel<client::Msg>>>,
+struct Handler(Arc<SessionState>);
+
+impl Deref for Handler {
+    type Target = SessionState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl Handler {
-    fn new(outbound_client_key: Arc<PrivateKey>) -> Self {
+impl SessionState {
+    fn new(outbound_server_addr: TargetAddr, outbound_client_key: PrivateKey) -> Self {
         Self {
+            outbound_server_addr,
             outbound_client_key,
-            outbound_session: Arc::new(SetOnce::new()),
-            inbound_session: Arc::new(SetOnce::new()),
+            inbound_client_pub_key: SetOnce::new(),
+            outbound_session: SetOnce::new(),
+            inbound_session: SetOnce::new(),
             // inbound_outbound_chan_id_map: Arc::new(RwLock::new(Vec::new())),
             // outbound_inbound_chan_id_map: Arc::new(RwLock::new(Vec::new())),
-            outbound_inbound_chan_id_map: Arc::new(DashMap::new()),
-            inbound_outbound_chan_map: Arc::new(DashMap::new()),
+            outbound_inbound_chan_id_map: DashMap::new(),
+            inbound_outbound_chan_map: DashMap::new(),
         }
     }
-    async fn outbound_handle(&self) -> MutexGuard<russh::client::Handle<Self>> {
+    async fn outbound_handle(&self) -> MutexGuard<russh::client::Handle<Handler>> {
         self.outbound_session.wait().await.lock().await
     }
     async fn inbound_handle(&self) -> &russh::server::Handle {
@@ -102,7 +156,7 @@ impl client::Handler for Handler {
         channel: ChannelId,
         session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        info!("client: channel success");
+        debug!("client: channel success");
         Ok(())
     }
 
@@ -112,7 +166,7 @@ impl client::Handler for Handler {
         channel: ChannelId,
         session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        info!("client: channel failure");
+        debug!("client: channel failure");
         Ok(())
     }
 
@@ -150,7 +204,7 @@ impl client::Handler for Handler {
         data: &[u8],
         session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        info!(
+        debug!(
             "DBG outbound server data: {}",
             String::from_utf8_lossy(data)
         );
@@ -169,7 +223,7 @@ impl client::Handler for Handler {
         exit_status: u32,
         session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        info!("DBG outbound server exit_status: {}", exit_status);
+        debug!("DBG outbound server exit_status: {}", exit_status);
         let inbound_channel_id = self.inbound_chan_id_get(channel);
         self.inbound_handle()
             .await
@@ -188,7 +242,7 @@ impl server::Handler for Handler {
         channel: Channel<server::Msg>,
         _session: &mut server::Session,
     ) -> Result<bool, Self::Error> {
-        info!("DBG channel_open_session {}", channel.id());
+        debug!("DBG channel_open_session {}", channel.id());
         let outbound_channel = self.outbound_handle().await.channel_open_session().await?;
         self.chan_map_set(channel.id(), outbound_channel);
         // {
@@ -223,7 +277,7 @@ impl server::Handler for Handler {
         user: &str,
         key: &ssh_key::PublicKey,
     ) -> Result<server::Auth, Self::Error> {
-        info!(
+        debug!(
             "DBG auth_publickey user={}, key={}",
             user,
             key.to_openssh().unwrap()
@@ -239,15 +293,18 @@ impl server::Handler for Handler {
             .await
             .authenticate_publickey(
                 user,
-                PrivateKeyWithHashAlg::new(self.outbound_client_key.clone(), hash_alg),
+                PrivateKeyWithHashAlg::new(Arc::new(self.outbound_client_key.clone()), hash_alg),
             )
             .await?;
 
         if !auth_res.success() {
             panic!("Authentication (with publickey) failed");
         } else {
-            info!("Authentication success");
+            debug!("Authentication success");
         }
+        self.inbound_client_pub_key
+            .set((user.to_string(), key.clone()))
+            .unwrap();
         Ok(server::Auth::Accept)
     }
 
@@ -257,7 +314,7 @@ impl server::Handler for Handler {
         _certificate: &Certificate,
     ) -> Result<server::Auth, Self::Error> {
         info!("DBG auth_openssh_certificate");
-        Ok(server::Auth::Accept)
+        Ok(server::Auth::UnsupportedMethod)
     }
 
     async fn exec_request(
@@ -266,9 +323,13 @@ impl server::Handler for Handler {
         data: &[u8],
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        let (user, pk) = self.inbound_client_pub_key.get().unwrap();
         info!(
-            "DBG exec_request chan {}: {}",
+            "DBG exec_request auth: ({}, {}) chan {}: {} - {}",
+            user,
+            pk.to_openssh().unwrap(),
             channel,
+            self.outbound_server_addr,
             String::from_utf8_lossy(data)
         );
         // TODO: Allow or deny based on config
@@ -285,7 +346,7 @@ impl server::Handler for Handler {
         data: &[u8],
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        info!("DBG inbound client data: {}", String::from_utf8_lossy(data));
+        debug!("DBG inbound client data: {}", String::from_utf8_lossy(data));
         let outbound_channel = self.outbound_chan_get(channel);
         outbound_channel.data(data).await?;
         // let data = format!("Got data: {}\r\n", String::from_utf8_lossy(data)).into_bytes();
@@ -305,37 +366,39 @@ impl server::Handler for Handler {
 ///
 /// Same as above but with UDP support
 ///     `$ RUST_LOG=debug cargo run --example server -- --listen-addr 127.0.0.1:1337 --allow-udp --public-addr 127.0.0.1 password --username admin --password password`
-// #[derive(Debug, StructOpt)]
-// #[structopt(
-//     name = "socks5-server",
-//     about = "A simple implementation of a socks5-server."
-// )]
-// struct Opt {
-//     /// Bind on address address. eg. `127.0.0.1:1080`
-//     #[structopt(short, long)]
-//     pub listen_addr: String,
-//
-//     /// Our external IP address to be sent in reply packets (required for UDP)
-//     #[structopt(long)]
-//     pub public_addr: Option<std::net::IpAddr>,
-//
-//     /// Request timeout
-//     #[structopt(short = "t", long, default_value = "10", parse(try_from_str=parse_duration))]
-//     pub request_timeout: Duration,
-//
-//     /// Choose authentication type
-//     #[structopt(subcommand, name = "auth")] // Note that we mark a field as a subcommand
-//     pub auth: AuthMode,
-//
-//     /// Don't perform the auth handshake, send directly the command request
-//     #[structopt(short = "k", long)]
-//     pub skip_auth: bool,
-//
-//     /// Allow UDP proxying, requires public-addr to be set
-//     #[structopt(short = "U", long)]
-//     pub allow_udp: bool,
-// }
-//
+#[derive(Debug, StructOpt)]
+#[structopt(name = "ssh-git-fw", about = "git over ssh proxy firewall")]
+struct Opt {
+    #[structopt(short = "c", long)]
+    pub config: PathBuf,
+
+    #[structopt(short = "r", long)]
+    pub rules: PathBuf,
+    //     /// Bind on address address. eg. `127.0.0.1:1080`
+    //     #[structopt(short, long)]
+    //     pub listen_addr: String,
+    //
+    //     /// Our external IP address to be sent in reply packets (required for UDP)
+    //     #[structopt(long)]
+    //     pub public_addr: Option<std::net::IpAddr>,
+    //
+    //     /// Request timeout
+    //     #[structopt(short = "t", long, default_value = "10", parse(try_from_str=parse_duration))]
+    //     pub request_timeout: Duration,
+    //
+    //     /// Choose authentication type
+    //     #[structopt(subcommand, name = "auth")] // Note that we mark a field as a subcommand
+    //     pub auth: AuthMode,
+    //
+    //     /// Don't perform the auth handshake, send directly the command request
+    //     #[structopt(short = "k", long)]
+    //     pub skip_auth: bool,
+    //
+    //     /// Allow UDP proxying, requires public-addr to be set
+    //     #[structopt(short = "U", long)]
+    //     pub allow_udp: bool,
+}
+
 // /// Choose the authentication type
 // #[derive(StructOpt, Debug, PartialEq)]
 // enum AuthMode {
@@ -357,6 +420,15 @@ impl server::Handler for Handler {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+
+    let opt = Opt::from_args();
+    let config_toml = fs::read(opt.config)?;
+    let config: Config = toml::from_slice(&config_toml).unwrap();
+    let rules_toml = fs::read(opt.rules)?;
+    let rules: HashMap<String, ClientRule> = toml::from_slice(&rules_toml).unwrap();
+
+    println!("config\n{:#?}", config);
+    println!("rules\n{:#?}", rules);
 
     let addr = "0.0.0.0:2324";
     let listener = TcpListener::bind(addr).await?;
@@ -406,10 +478,10 @@ async fn main() -> Result<()> {
         ..<_>::default()
     };
 
-    let config = Config {
+    let config = SshConfig {
         ssh_server: Arc::new(config_ssh_server),
         ssh_client: Arc::new(config_ssh_client),
-        outbound_client_key: Arc::new(client_key),
+        outbound_client_key: client_key,
     };
 
     // Standard TCP loop
@@ -431,34 +503,17 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve_socks5(socket: tokio::net::TcpStream, config: Config) -> Result<(), SocksError> {
+async fn serve_socks5(socket: tokio::net::TcpStream, config: SshConfig) -> Result<(), SocksError> {
     let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket)
         .await?
         .read_command()
         .await?;
-    info!("DBG accept socks5 to {}", target_addr);
-
-    let socket_addrs = match target_addr {
-        TargetAddr::Ip(ip) => vec![ip],
-        TargetAddr::Domain(domain, port) => {
-            debug!("Attempt to DNS resolve the domain {}...", &domain);
-
-            let socket_addrs: Vec<_> = net::lookup_host((&domain[..], port))
-                .await
-                .map_err(|err| AddrError::DNSResolutionFailed(err))?
-                .collect();
-            if socket_addrs.is_empty() {
-                return Err(AddrError::NoDNSRecords)?;
-            }
-            debug!("domain name resolved to {:?}", socket_addrs);
-            socket_addrs
-        }
-    };
+    debug!("DBG accept socks5 to {}", target_addr);
 
     match cmd {
         Socks5Command::TCPConnect => {
             // TODO: Duration from config
-            run_tcp_proxy(proto, &socket_addrs, config, Duration::from_secs(5)).await?;
+            run_tcp_proxy(proto, target_addr, config, Duration::from_secs(5)).await?;
         }
         _ => {
             proto.reply_error(&ReplyError::CommandNotSupported).await?;
@@ -501,11 +556,28 @@ where
 /// Handle the connect command by running a TCP proxy until the connection is done.
 async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     proto: Socks5ServerProtocol<T, states::CommandRead>,
-    addrs: &[SocketAddr],
-    config: Config,
+    target_addr: TargetAddr,
+    config: SshConfig,
     request_timeout: Duration,
     // nodelay: bool,
 ) -> Result<(), SocksServerError> {
+    let addrs = match &target_addr {
+        TargetAddr::Ip(ip) => vec![*ip],
+        TargetAddr::Domain(domain, port) => {
+            debug!("Attempt to DNS resolve the domain {}...", &domain);
+
+            let socket_addrs: Vec<_> = net::lookup_host((&domain[..], *port))
+                .await
+                .map_err(|err| AddrError::DNSResolutionFailed(err))?
+                .collect();
+            if socket_addrs.is_empty() {
+                return Err(AddrError::NoDNSRecords)?;
+            }
+            debug!("domain name resolved to {:?}", socket_addrs);
+            socket_addrs
+        }
+    };
+
     // let _addr = try_notify!(
     //     proto,
     //     addr.to_socket_addrs()
@@ -532,7 +604,10 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         .reply_success(outbound_stream.local_addr().expect("ok"))
         .await?;
 
-    let handler = Handler::new(config.outbound_client_key);
+    let handler = Handler(Arc::new(SessionState::new(
+        target_addr,
+        config.outbound_client_key,
+    )));
     let outbound_session =
         match russh::client::connect_stream(config.ssh_client, outbound_stream, handler.clone())
             .await

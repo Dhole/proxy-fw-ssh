@@ -1,0 +1,8 @@
+["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29c"]
+name = "test-env"
+
+servers."127.0.0.1:2222" = {
+    git = {
+        "/git/test1.git" = "rw",
+    }
+}

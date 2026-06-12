@@ -13,3 +13,5 @@ rand = { version = "0.10", features = ["thread_rng"] }
 fast-socks5 = "1.0.0"
 dashmap = "6.2.1"
 bytes = "1.11.1"
+serde = { version = "1.0.228", features = ["derive"] }
+structopt = "0.3.26"
