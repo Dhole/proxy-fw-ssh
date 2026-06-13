@@ -35,6 +35,7 @@ use tokio::{
     net::{self, TcpListener},
     sync::{MappedMutexGuard, Mutex, MutexGuard, OnceCell, RwLock, RwLockReadGuard, SetOnce},
     task,
+    time::sleep,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,16 +70,16 @@ impl ClientRules {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ServerRules {
-    git: GitServerRules,
+    git: GitRules,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct GitServerRules {
+struct GitRules {
     #[serde(flatten)]
-    paths: HashMap<String, AccessRule>,
+    paths: HashMap<String, GitAccessRule>,
 }
 
-impl GitServerRules {
+impl GitRules {
     fn validate_exec(&self, data: &str) -> Result<(), String> {
         let Some(args) = shlex::split(data) else {
             return Err("parsing command".to_string());
@@ -89,7 +90,6 @@ impl GitServerRules {
         let Some(arg1) = args.get(1) else {
             return Err("missing arg1".to_string());
         };
-        println!("DBG {:?}", self.paths);
         let access_rule = self.paths.get(arg1).cloned().unwrap_or_default();
         if arg0 == "git-upload-pack" && access_rule.read() {
             Ok(())
@@ -105,22 +105,28 @@ impl GitServerRules {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-enum AccessRule {
-    #[default]
-    #[serde(rename = "")]
-    None,
-    #[serde(rename = "r")]
-    Read,
-    #[serde(rename = "rw")]
-    ReadWrite,
+struct GitAccessRule {
+    read: Permission,
+    write: Permission,
 }
 
-impl AccessRule {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+enum Permission {
+    #[default]
+    #[serde(rename = "ask")]
+    Ask,
+    #[serde(rename = "yes")]
+    Yes,
+    #[serde(rename = "no")]
+    No,
+}
+
+impl GitAccessRule {
     fn read(&self) -> bool {
-        matches!(self, AccessRule::Read | AccessRule::ReadWrite)
+        matches!(self.read, Permission::Yes)
     }
     fn write(&self) -> bool {
-        matches!(self, AccessRule::ReadWrite)
+        matches!(self.write, Permission::Yes)
     }
 }
 
@@ -349,10 +355,6 @@ impl server::Handler for Handler {
         debug!("DBG channel_open_session {}", channel.id());
         let outbound_channel = self.outbound_handle().await.channel_open_session().await?;
         self.set_chan_map(channel.id(), outbound_channel);
-        // {
-        //     let mut clients = self.clients.lock().await;
-        //     clients.insert(self.id, (channel.id(), session.handle()));
-        // }
         Ok(true)
     }
 
@@ -442,6 +444,7 @@ impl server::Handler for Handler {
             .validate_exec(&server_addr, user, data)
         {
             Ok(()) => info!("approved exec"),
+
             Err(e) => {
                 info!("denied exec: {}", e);
                 panic!("TODO");
@@ -492,9 +495,6 @@ async fn main() -> Result<()> {
     let rules: Rules = toml::from_slice(&rules_toml).unwrap();
     let rules = Arc::new(RwLock::new(rules));
 
-    println!("config\n{:#?}", config);
-    println!("rules\n{:#?}", rules);
-
     let addr = &config.inbound_server_address;
     let listener = TcpListener::bind(addr).await?;
 
@@ -532,7 +532,8 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let config_ssh_client = client::Config {
-        inactivity_timeout: Some(Duration::from_secs(5)),
+        inactivity_timeout: Some(Duration::from_secs(3600)),
+        keepalive_interval: Some(Duration::from_secs(2)),
         preferred: Preferred {
             kex: Cow::Owned(vec![
                 russh::kex::CURVE25519_PRE_RFC_8731,
@@ -702,6 +703,14 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
         }
     }
+    // russh doesn't expose the (reason, description, language_tag) of a client disconnect, so we
+    // can't propagate those values when we disconnect the outbound session.
+    handler
+        .outbound_handle()
+        .await
+        .disconnect(russh::Disconnect::ByApplication, "", "")
+        .await
+        .unwrap();
 
     Ok(())
 }
