@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::{cell::RefCell, rc::Rc, sync::OnceLock};
 
-use gtk4::{glib, prelude::*, Application, ApplicationWindow};
+use gtk4::{glib, prelude::*, Application, ApplicationWindow, Button};
 use std::{
     borrow::Cow,
     fs,
@@ -640,18 +640,33 @@ fn main() -> glib::ExitCode {
         tx_user_req,
     };
 
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = Application::builder().build();
+    let _app_hold = app.hold();
 
-    let window_slot: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    // let window_slot: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
+
+    // gtk4::init().unwrap();
+    // let win = ApplicationWindow::builder()
+    //     .application(&app)
+    //     .title("My App")
+    //     .default_width(400)
+    //     .default_height(300)
+    //     .build();
+
+    // win.connect_close_request(|w| {
+    //     w.set_visible(false);
+    //     glib::Propagation::Stop
+    // });
+    // let win = Arc::new(win);
 
     // GLib-native channel: tokio thread → GTK main loop
     // The Sender is Send, the Receiver integrates with the GLib event loop
     let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
 
-    // Spawn the tokio task — sends a wakeup every 30 seconds
+    // Spawn the tokio task — sends a wakeup every 10 seconds
     runtime().spawn(async move {
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             if wake_tx.send(()).await.is_err() {
                 break; // GTK side shut down
             }
@@ -686,46 +701,56 @@ fn main() -> glib::ExitCode {
 
     let wake_rx = Rc::new(RefCell::new(Some(wake_rx)));
     app.connect_startup({
+        // let window_slot = window_slot.clone();
+        // let win = win.clone();
+        // let wake_rx = wake_rx;
         let app = app.clone();
-        let window_slot = window_slot.clone();
         move |_| {
-            app.hold();
+            println!("DBG connect_startup");
+            // let window_slot = window_slot.clone();
+            // let win = win.clone();
 
+            let app = app.clone();
             // Receive wakeups on the GTK main loop via glib::spawn_future_local
             let wake_rx = wake_rx.borrow_mut().take().unwrap();
-            let window_slot = window_slot.clone();
+            // let wake_rx = wake_rx.clone();
             glib::spawn_future_local(async move {
                 while wake_rx.recv().await.is_ok() {
-                    if let Some(win) = window_slot.borrow().as_ref() {
-                        win.present();
-                    }
+                    let button = Button::builder()
+                        .label("Press me!")
+                        .margin_top(12)
+                        .margin_bottom(12)
+                        .margin_start(12)
+                        .margin_end(12)
+                        .build();
+
+                    button.connect_clicked(|button| {
+                        // Set the label to "Hello World!" after the button has been clicked on
+                        button.set_label("Hello World!");
+                    });
+
+                    let win = ApplicationWindow::builder()
+                        .application(&app)
+                        .title("My App")
+                        .default_width(400)
+                        .default_height(300)
+                        .child(&button)
+                        .build();
+
+                    win.connect_close_request(|w| {
+                        w.set_visible(false);
+                        glib::Propagation::Stop
+                    });
+
+                    win.present();
                 }
             });
         }
     });
 
-    app.connect_activate({
-        let app = app.clone();
-        move |_| {
-            let mut slot = window_slot.borrow_mut();
-            if slot.is_none() {
-                let win = ApplicationWindow::builder()
-                    .application(&app)
-                    .title("My App")
-                    .default_width(400)
-                    .default_height(300)
-                    .build();
-
-                win.connect_close_request(|w| {
-                    w.set_visible(false);
-                    glib::Propagation::Stop
-                });
-
-                *slot = Some(win);
-            }
-
-            slot.as_ref().unwrap().present();
-        }
+    app.connect_activate(move |_| {
+        println!("DBG connect_activate");
+        // win.present();
     });
 
     app.run_with_args::<glib::GString>(&[])
