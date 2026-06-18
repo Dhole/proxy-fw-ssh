@@ -4,10 +4,7 @@
 use std::collections::HashMap;
 use std::{cell::RefCell, rc::Rc, sync::OnceLock};
 
-use gtk4::{
-    self as gtk, glib, prelude::*, Align, Application, ApplicationWindow, Button, Justification,
-    Label,
-};
+use gtk4::glib;
 use std::{
     borrow::Cow,
     fs,
@@ -56,7 +53,8 @@ use crate::model::Permission;
 use rules::ClientRules;
 use rules::RequestHandler;
 use rules::Rules;
-use ui::messages::UiRequest;
+use ui::main_ui;
+use ui::messages::{ReplyPermission, UiRequest};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
@@ -509,9 +507,6 @@ fn main() -> glib::ExitCode {
         req_tx,
     };
 
-    let app = Application::builder().build();
-    let _app_hold = app.hold();
-
     // Proxy server main loop
     runtime().spawn(async move {
         let listener = TcpListener::bind(addr).await.unwrap();
@@ -534,107 +529,7 @@ fn main() -> glib::ExitCode {
         }
     });
 
-    let req_rx = Rc::new(RefCell::new(Some(req_rx)));
-    app.connect_startup({
-        // let window_slot = window_slot.clone();
-        // let win = win.clone();
-        // let wake_rx = wake_rx;
-        let app = app.clone();
-        move |_| {
-            println!("DBG connect_startup");
-            // let window_slot = window_slot.clone();
-            // let win = win.clone();
-
-            let app = app.clone();
-            // Receive wakeups on the GTK main loop via glib::spawn_future_local
-            let req_rx = req_rx.borrow_mut().take().unwrap();
-            // let wake_rx = wake_rx.clone();
-            glib::spawn_future_local(async move {
-                while let Ok(req) = req_rx.recv().await {
-                    let win = ApplicationWindow::builder()
-                        .application(&app)
-                        .title("proxy-fw-ssh")
-                        .default_width(32)
-                        .default_height(32)
-                        .build();
-                    match req {
-                        UiRequest::Permission(r) => {
-                            win.connect_close_request({
-                                let reply = r.reply.clone();
-                                move |w| {
-                                    reply.set((false, Permission::Ask)).unwrap_or_default();
-                                    w.set_visible(false);
-                                    glib::Propagation::Stop
-                                }
-                            });
-                            let grid = gtk::Grid::builder()
-                                .margin_start(6)
-                                .margin_end(6)
-                                .margin_top(6)
-                                .margin_bottom(6)
-                                .halign(gtk::Align::Center)
-                                .valign(gtk::Align::Center)
-                                .row_spacing(6)
-                                .column_spacing(6)
-                                .build();
-                            win.set_child(Some(&grid));
-                            let label = Label::builder().justify(Justification::Center).build();
-                            label.set_markup(&format!(
-                                concat!("Allow\n", "<b>{}</b>\n", "to {}?"),
-                                r.pk_openssh, r.action
-                            ));
-
-                            let btn_allow = Button::builder().label("Allow always").build();
-                            let btn_allow_once = Button::builder().label("Allow once").build();
-                            let btn_deny = Button::builder().label("Deny always").build();
-
-                            btn_allow.connect_clicked({
-                                let win = win.clone();
-                                let reply = r.reply.clone();
-                                move |button| {
-                                    println!("DBG allow always");
-                                    reply.set((true, Permission::Yes)).unwrap();
-                                    win.close();
-                                }
-                            });
-                            btn_allow_once.connect_clicked({
-                                let win = win.clone();
-                                let reply = r.reply.clone();
-                                move |button| {
-                                    println!("DBG allow once");
-                                    reply.set((true, Permission::Ask)).unwrap();
-                                    win.close();
-                                }
-                            });
-                            btn_deny.connect_clicked({
-                                let win = win.clone();
-                                let reply = r.reply.clone();
-                                move |button| {
-                                    println!("DBG deny always");
-                                    reply.set((false, Permission::No)).unwrap();
-                                    win.close();
-                                }
-                            });
-
-                            grid.attach(&label, 0, 0, 3, 1);
-                            grid.attach(&btn_allow, 0, 1, 1, 1);
-                            grid.attach(&btn_allow_once, 1, 1, 1, 1);
-                            grid.attach(&btn_deny, 2, 1, 1, 1);
-                        }
-                    }
-
-                    win.present();
-                }
-            });
-        }
-    });
-
-    app.connect_activate(move |_| {
-        println!("DBG connect_activate");
-        // win.present();
-    });
-
-    app.run_with_args::<glib::GString>(&[])
+    main_ui(req_rx)
 }
 
 async fn serve_socks5(

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use crate::model::Permission;
-use crate::ui::messages::{PermissionRequest, UiRequest};
+use crate::ui::messages::{ReplyPermission, RequestPermission, UiRequest};
 use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::SetOnce;
+use tokio::sync::oneshot;
 
 pub struct RequestHandler {
     pub pk_openssh: String,
@@ -13,15 +13,15 @@ pub struct RequestHandler {
 }
 
 impl RequestHandler {
-    async fn request(&self, action: String) -> (bool, Permission) {
-        let reply = Arc::new(SetOnce::new());
-        let req = PermissionRequest {
+    async fn request(&self, action: String) -> ReplyPermission {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = RequestPermission {
             pk_openssh: self.pk_openssh.clone(),
             action,
-            reply: reply.clone(),
+            reply_tx,
         };
         self.tx.send(UiRequest::Permission(req)).await.unwrap();
-        reply.wait().await.clone()
+        reply_rx.await.unwrap()
     }
 }
 
@@ -95,26 +95,28 @@ impl GitRules {
                 Permission::Yes => Ok(()),
                 Permission::No => Err("read not allowed".to_string()),
                 Permission::Ask => {
-                    let (r, _perm) = handler.request(format!("read from {}", arg1)).await;
-                    if r {
+                    let ReplyPermission { now, future } =
+                        handler.request(format!("read from {}", arg1)).await;
+                    if now {
                         Ok(())
                     } else {
                         Err("interactively denied".to_string())
                     }
-                    // TODO: update rules with _perm
+                    // TODO: update rules with future
                 }
             },
             "git-receive-pack" => match access_rule.write {
                 Permission::Yes => Ok(()),
                 Permission::No => Err("write not allowed".to_string()),
                 Permission::Ask => {
-                    let (r, _perm) = handler.request(format!("write to {}", arg1)).await;
-                    if r {
+                    let ReplyPermission { now, future } =
+                        handler.request(format!("write to {}", arg1)).await;
+                    if now {
                         Ok(())
                     } else {
                         Err("interactively denied".to_string())
                     }
-                    // TODO: update rules with _perm
+                    // TODO: update rules with future
                 }
             },
             _ => Err(format!("invalid command {}", arg0)),

@@ -1,14 +1,20 @@
 use std::sync::Arc;
-use tokio::sync::SetOnce;
+use tokio::sync::oneshot;
 
 use crate::model::Permission;
 
 pub enum UiRequest {
-    Permission(PermissionRequest),
+    Permission(RequestPermission),
 }
 
-pub struct PermissionRequest {
+pub struct RequestPermission {
     pub pk_openssh: String,
     pub action: String,
-    pub reply: Arc<SetOnce<(bool, Permission)>>,
+    pub reply_tx: oneshot::Sender<ReplyPermission>,
+}
+
+#[derive(Debug)]
+pub struct ReplyPermission {
+    pub now: bool,
+    pub future: Permission,
 }
