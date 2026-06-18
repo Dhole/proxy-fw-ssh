@@ -18,17 +18,16 @@ EOF
 
 RUN adduser -D -s /usr/bin/git-shell git
 
-RUN mkdir /home/git/.ssh
-COPY <<EOF /home/git/.ssh/authorized_keys
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29c
-EOF
-
 RUN mkdir /git
 RUN cd /git && \
     chown -R git:git . && \
     chmod -R ug+rwX .
 
 USER git
+
+RUN mkdir ~/.ssh
+COPY id_ed25519_outbound_client.pub /tmp/id.pub
+RUN cat /tmp/id.pub >> ~/.ssh/authorized_keys
 
 RUN cd /git && \
     git init --bare test1.git && \

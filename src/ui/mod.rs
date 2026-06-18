@@ -14,12 +14,13 @@ fn win_req_permission(win: &ApplicationWindow, r: RequestPermission) {
     win.connect_close_request({
         let reply_tx = reply_tx.clone();
         move |w| {
+            println!("DBG close request");
             if let Some(tx) = reply_tx.take() {
                 tx.send(ReplyPermission {
                     now: false,
                     future: Permission::Ask,
                 })
-                .unwrap();
+                .expect("send once");
             }
             w.set_visible(false);
             glib::Propagation::Stop
@@ -51,13 +52,12 @@ fn win_req_permission(win: &ApplicationWindow, r: RequestPermission) {
         let reply_tx = reply_tx.clone();
         move |button| {
             println!("DBG allow always");
-            if let Some(tx) = reply_tx.take() {
-                tx.send(ReplyPermission {
-                    now: true,
-                    future: Permission::Yes,
-                })
-                .unwrap();
-            }
+            let tx = reply_tx.take().expect("first take");
+            tx.send(ReplyPermission {
+                now: true,
+                future: Permission::Yes,
+            })
+            .expect("send once");
             win.close();
         }
     });
@@ -66,13 +66,12 @@ fn win_req_permission(win: &ApplicationWindow, r: RequestPermission) {
         let reply_tx = reply_tx.clone();
         move |button| {
             println!("DBG allow once");
-            if let Some(tx) = reply_tx.take() {
-                tx.send(ReplyPermission {
-                    now: true,
-                    future: Permission::Ask,
-                })
-                .unwrap();
-            }
+            let tx = reply_tx.take().expect("first take");
+            tx.send(ReplyPermission {
+                now: true,
+                future: Permission::Ask,
+            })
+            .expect("send once");
             win.close();
         }
     });
@@ -81,13 +80,12 @@ fn win_req_permission(win: &ApplicationWindow, r: RequestPermission) {
         let reply_tx = reply_tx.clone();
         move |button| {
             println!("DBG deny always");
-            if let Some(tx) = reply_tx.take() {
-                tx.send(ReplyPermission {
-                    now: false,
-                    future: Permission::No,
-                })
-                .unwrap();
-            }
+            let tx = reply_tx.take().expect("first take");
+            tx.send(ReplyPermission {
+                now: false,
+                future: Permission::No,
+            })
+            .expect("send once");
             win.close();
         }
     });
@@ -116,7 +114,7 @@ pub fn main_ui(req_rx: Receiver<UiRequest>) -> glib::ExitCode {
 
             let app = app.clone();
             // Receive wakeups on the GTK main loop via glib::spawn_future_local
-            let req_rx = req_rx.borrow_mut().take().unwrap();
+            let req_rx = req_rx.take().unwrap();
             // let wake_rx = wake_rx.clone();
             glib::spawn_future_local(async move {
                 while let Ok(req) = req_rx.recv().await {
