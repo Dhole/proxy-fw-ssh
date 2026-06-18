@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 // use tokio::sync::Mutex;
 use std::collections::HashMap;
 use std::{cell::RefCell, rc::Rc, sync::OnceLock};
@@ -46,162 +48,21 @@ use tokio::{
     time::sleep,
 };
 
+pub mod model;
+pub mod rules;
+pub mod ui;
+
+use crate::model::Permission;
+use rules::ClientRules;
+use rules::RequestHandler;
+use rules::Rules;
+use ui::messages::UiRequest;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
     inbound_server_address: String,
-    inbound_server_identity_file: PathBuf,
-    outbound_client_identity_file: PathBuf,
-}
-
-type Rules = HashMap<String, ClientRules>;
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct ClientRules {
-    name: Option<String>,
-    servers: HashMap<String, ServerRules>,
-}
-
-enum UiRequest {
-    Permission(PermissionRequest),
-}
-
-struct PermissionRequest {
-    pk_openssh: String,
-    action: String,
-    reply: Arc<SetOnce<(bool, Permission)>>,
-}
-
-struct RequestHandler {
-    pk_openssh: String,
-    tx: Sender<UiRequest>,
-}
-
-impl RequestHandler {
-    async fn request(&self, action: String) -> (bool, Permission) {
-        let reply = Arc::new(SetOnce::new());
-        let req = PermissionRequest {
-            pk_openssh: self.pk_openssh.clone(),
-            action,
-            reply: reply.clone(),
-        };
-        self.tx.send(UiRequest::Permission(req)).await.unwrap();
-        reply.wait().await.clone()
-    }
-}
-
-impl ClientRules {
-    async fn validate_exec(
-        &self,
-        handler: &RequestHandler,
-        server_addr: &str,
-        user: &str,
-        data: &str,
-    ) -> Result<(), String> {
-        let Some(server_rules) = self.servers.get(server_addr) else {
-            return Err(format!("server {} not in rules", server_addr));
-        };
-        if GitRules::matches_exec(user, data) {
-            return server_rules
-                .git
-                .validate_exec(handler, user, data)
-                .await
-                .map_err(|e| format!("git: {}", e));
-        }
-        return Err(format!(
-            "no plugin matches with user:{}, data:{}",
-            user, data
-        ));
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ServerRules {
-    git: GitRules,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct GitRules {
-    #[serde(flatten)]
-    paths: HashMap<String, GitAccessRule>,
-}
-
-impl GitRules {
-    fn matches_exec(user: &str, data: &str) -> bool {
-        user == "git"
-            && (data.starts_with("git-upload-pack") || data.starts_with("git-receive-pack"))
-    }
-    async fn validate_exec(
-        &self,
-        handler: &RequestHandler,
-        _user: &str,
-        data: &str,
-    ) -> Result<(), String> {
-        let Some(args) = shlex::split(data) else {
-            return Err("parsing command".to_string());
-        };
-        let Some(arg0) = args.get(0) else {
-            return Err("missing arg0".to_string());
-        };
-        let Some(arg1) = args.get(1) else {
-            return Err("missing arg1".to_string());
-        };
-        let access_rule = self.paths.get(arg1).cloned().unwrap_or_default();
-        match arg0.as_str() {
-            "git-upload-pack" => match access_rule.read {
-                Permission::Yes => Ok(()),
-                Permission::No => Err("read not allowed".to_string()),
-                Permission::Ask => {
-                    let (r, _perm) = handler.request(format!("read from {}", arg1)).await;
-                    if r {
-                        Ok(())
-                    } else {
-                        Err("interactively denied".to_string())
-                    }
-                    // TODO: update rules with _perm
-                }
-            },
-            "git-receive-pack" => match access_rule.write {
-                Permission::Yes => Ok(()),
-                Permission::No => Err("write not allowed".to_string()),
-                Permission::Ask => {
-                    let (r, _perm) = handler.request(format!("write to {}", arg1)).await;
-                    if r {
-                        Ok(())
-                    } else {
-                        Err("interactively denied".to_string())
-                    }
-                    // TODO: update rules with _perm
-                }
-            },
-            _ => Err(format!("invalid command {}", arg0)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct GitAccessRule {
-    read: Permission,
-    write: Permission,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-enum Permission {
-    #[default]
-    #[serde(rename = "ask")]
-    Ask,
-    #[serde(rename = "yes")]
-    Yes,
-    #[serde(rename = "no")]
-    No,
-}
-
-impl GitAccessRule {
-    fn read(&self) -> bool {
-        matches!(self.read, Permission::Yes)
-    }
-    fn write(&self) -> bool {
-        matches!(self.write, Permission::Yes)
-    }
+    inbound_server_identity_file: String,
+    outbound_client_identity_file: String,
 }
 
 #[derive(Clone)]
@@ -266,7 +127,7 @@ impl SessionState {
             rules,
         }
     }
-    async fn outbound_handle(&self) -> MutexGuard<russh::client::Handle<Handler>> {
+    async fn outbound_handle(&self) -> MutexGuard<'_, russh::client::Handle<Handler>> {
         self.outbound_session.wait().await.lock().await
     }
     async fn inbound_handle(&self) -> &russh::server::Handle {
@@ -284,7 +145,7 @@ impl SessionState {
         self.inbound_outbound_chan_map
             .insert(u32::from(inbound_id), outbound_chan);
     }
-    fn outbound_chan(&self, inbound_id: ChannelId) -> Ref<u32, Channel<client::Msg>> {
+    fn outbound_chan(&self, inbound_id: ChannelId) -> Ref<'_, u32, Channel<client::Msg>> {
         self.inbound_outbound_chan_map
             .get(&u32::from(inbound_id))
             .unwrap()
@@ -570,8 +431,6 @@ struct Opt {
     pub rules: PathBuf,
 }
 
-const APP_ID: &str = "com.example.MyApp";
-
 use tokio::runtime::Runtime;
 
 fn runtime() -> &'static Runtime {
@@ -594,30 +453,32 @@ fn main() -> glib::ExitCode {
     info!("Listen for socks connections @ {}", addr);
 
     // Testing hardcoded key
-    let server_key = PrivateKey::new(
-        KeypairData::Ed25519(Ed25519Keypair::from_seed(&[0; 32])),
-        "",
-    )
-    .unwrap();
+    let inbound_server_identity_file = shellexpand::tilde(&config.inbound_server_identity_file);
+    let inbound_server_key =
+        PrivateKey::read_openssh_file(inbound_server_identity_file.as_ref()).unwrap();
     info!(
         "inbound server key: {}",
-        server_key.public_key().to_openssh().unwrap()
+        inbound_server_key.public_key().to_openssh().unwrap()
     );
-    let client_key = PrivateKey::new(
-        KeypairData::Ed25519(Ed25519Keypair::from_seed(&[1; 32])),
-        "",
-    )
-    .unwrap();
+    if inbound_server_key.is_encrypted() {
+        panic!("encrypted openssh inbound server key not yet supported");
+    }
+    let outbound_client_identity_file = shellexpand::tilde(&config.outbound_client_identity_file);
+    let outbound_client_key =
+        PrivateKey::read_openssh_file(outbound_client_identity_file.as_ref()).unwrap();
     info!(
         "outbound client key: {}",
-        client_key.public_key().to_openssh().unwrap()
+        outbound_client_key.public_key().to_openssh().unwrap()
     );
+    if outbound_client_key.is_encrypted() {
+        panic!("encrypted openssh inbound server key not yet supported");
+    }
 
     let config_ssh_server = russh::server::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         auth_rejection_time: Duration::from_secs(3),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
-        keys: vec![server_key],
+        keys: vec![inbound_server_key],
         preferred: Preferred {
             // kex: std::borrow::Cow::Owned(vec![russh::kex::DH_GEX_SHA256]),
             ..Preferred::default()
@@ -639,15 +500,11 @@ fn main() -> glib::ExitCode {
 
     let local = task::LocalSet::new();
 
-    //     let (tx_user_req, mut rx_user_req) = mpsc::channel::<PermissionRequest>(16);
-
-    // GLib-native channel: tokio thread → GTK main loop
-    // The Sender is Send, the Receiver integrates with the GLib event loop
     let (req_tx, req_rx) = async_channel::bounded::<UiRequest>(16);
     let setup = Setup {
         ssh_server: Arc::new(config_ssh_server),
         ssh_client: Arc::new(config_ssh_client),
-        outbound_client_key: client_key,
+        outbound_client_key,
         request_timeout: Duration::from_secs(5),
         req_tx,
     };
@@ -655,33 +512,7 @@ fn main() -> glib::ExitCode {
     let app = Application::builder().build();
     let _app_hold = app.hold();
 
-    // let window_slot: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
-
-    // gtk::init().unwrap();
-    // let win = ApplicationWindow::builder()
-    //     .application(&app)
-    //     .title("My App")
-    //     .default_width(400)
-    //     .default_height(300)
-    //     .build();
-
-    // win.connect_close_request(|w| {
-    //     w.set_visible(false);
-    //     glib::Propagation::Stop
-    // });
-    // let win = Arc::new(win);
-
-    // Spawn the tokio task — sends a wakeup every 10 seconds
-    // runtime().spawn(async move {
-    //     loop {
-    //         if req_tx.send(()).await.is_err() {
-    //             break; // GTK side shut down
-    //         }
-    //         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-    //     }
-    // });
-
-    // Standard TCP loop
+    // Proxy server main loop
     runtime().spawn(async move {
         let listener = TcpListener::bind(addr).await.unwrap();
         loop {
@@ -702,10 +533,6 @@ fn main() -> glib::ExitCode {
             }
         }
     });
-
-    // while let Some(req) = rx_user_req.recv().await {
-    //     req.reply.set((true, Permission::Ask)).unwrap();
-    // }
 
     let req_rx = Rc::new(RefCell::new(Some(req_rx)));
     app.connect_startup({
