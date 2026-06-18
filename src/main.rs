@@ -50,11 +50,9 @@ pub mod rules;
 pub mod ui;
 
 use crate::model::Permission;
-use rules::ClientRules;
-use rules::RequestHandler;
-use rules::Rules;
+use rules::{RequestRules, RequestRulesExec, Rules};
 use ui::main_ui;
-use ui::messages::{ReplyPermission, UiRequest};
+use ui::messages::{ReplyPermission, RequestUi};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
@@ -69,7 +67,7 @@ struct Setup {
     ssh_client: Arc<russh::client::Config>,
     outbound_client_key: PrivateKey,
     request_timeout: Duration,
-    req_tx: Sender<UiRequest>,
+    req_rules_tx: Sender<RequestRules>,
 }
 
 struct SessionState {
@@ -83,14 +81,15 @@ struct SessionState {
     // Requires mut
     outbound_session: SetOnce<Mutex<russh::client::Handle<Handler>>>,
     inbound_session: SetOnce<russh::server::Handle>,
-    client_rules: SetOnce<ClientRules>,
-    req_tx: Sender<UiRequest>,
+    //
+    // Actors
+    //
+    req_rules_tx: Sender<RequestRules>,
     //
     // Dynamic
     //
     outbound_inbound_chan_id_map: DashMap<u32, ChannelId>,
     inbound_outbound_chan_map: DashMap<u32, Channel<client::Msg>>,
-    rules: Arc<RwLock<Rules>>,
 }
 
 #[derive(Clone)]
@@ -108,8 +107,7 @@ impl SessionState {
     fn new(
         outbound_server_addr: TargetAddr,
         outbound_client_key: PrivateKey,
-        rules: Arc<RwLock<Rules>>,
-        req_tx: Sender<UiRequest>,
+        req_rules_tx: Sender<RequestRules>,
     ) -> Self {
         Self {
             outbound_server_addr,
@@ -118,11 +116,9 @@ impl SessionState {
             inbound_client_pk_openssh: SetOnce::new(),
             outbound_session: SetOnce::new(),
             inbound_session: SetOnce::new(),
-            client_rules: SetOnce::new(),
-            req_tx,
+            req_rules_tx: req_rules_tx,
             outbound_inbound_chan_id_map: DashMap::new(),
             inbound_outbound_chan_map: DashMap::new(),
-            rules,
         }
     }
     async fn outbound_handle(&self) -> MutexGuard<'_, russh::client::Handle<Handler>> {
@@ -163,30 +159,30 @@ impl SessionState {
             .set(pk_openssh)
             .expect("pk not set");
     }
-    async fn client_rules(&self) -> &ClientRules {
-        if let Some(client_rules) = self.client_rules.get() {
-            &client_rules
-        } else {
-            // Make a local copy of the client rules for this session
-            let pk_ssh = self.inbound_client_pk_openssh();
-            let client_rules = self
-                .rules
-                .read()
-                .await
-                .get(pk_ssh)
-                .cloned()
-                .unwrap_or_default();
-            // This set could be raced but the value would be the same, so we ignore the error
-            self.client_rules.set(client_rules).unwrap_or_default();
-            self.client_rules.get().expect("just set")
-        }
-    }
-    fn user_req_handler(&self) -> RequestHandler {
-        RequestHandler {
-            pk_openssh: self.inbound_client_pk_openssh().to_string(),
-            tx: self.req_tx.clone(),
-        }
-    }
+    // async fn client_rules(&self) -> &ClientRules {
+    //     if let Some(client_rules) = self.client_rules.get() {
+    //         &client_rules
+    //     } else {
+    //         // Make a local copy of the client rules for this session
+    //         let pk_ssh = self.inbound_client_pk_openssh();
+    //         let client_rules = self
+    //             .rules
+    //             .read()
+    //             .await
+    //             .get(pk_ssh)
+    //             .cloned()
+    //             .unwrap_or_default();
+    //         // This set could be raced but the value would be the same, so we ignore the error
+    //         self.client_rules.set(client_rules).unwrap_or_default();
+    //         self.client_rules.get().expect("just set")
+    //     }
+    // }
+    // fn user_req_handler(&self) -> RequestUiHandler {
+    //     RequestUiHandler {
+    //         pk_openssh: self.inbound_client_pk_openssh().to_string(),
+    //         tx: self.req_ui_tx.clone(),
+    //     }
+    // }
 }
 
 // More SSH event handlers
@@ -381,12 +377,14 @@ impl server::Handler for Handler {
         );
         let server_addr = format!("{}", self.outbound_server_addr);
         let data = str::from_utf8(data).expect("TODO");
-        let user_req_handler = self.user_req_handler();
-        match self
-            .client_rules()
-            .await
-            .validate_exec(&user_req_handler, &server_addr, user, data)
-            .await
+        match (RequestRulesExec {
+            pk_openssh: self.inbound_client_pk_openssh().to_string(),
+            server_addr,
+            user: user.clone(),
+            data: data.to_string(),
+        })
+        .request(&self.req_rules_tx)
+        .await
         {
             Ok(()) => info!("approved exec"),
 
@@ -439,12 +437,13 @@ fn runtime() -> &'static Runtime {
 fn main() -> glib::ExitCode {
     env_logger::init();
 
+    let (req_ui_tx, req_ui_rx) = async_channel::bounded::<RequestUi>(16);
+    let (req_rules_tx, req_rules_rx) = async_channel::bounded::<RequestRules>(16);
+
     let opt = Opt::from_args();
     let config_toml = fs::read(opt.config).expect("TODO");
     let config: Config = toml::from_slice(&config_toml).unwrap();
-    let rules_toml = fs::read(opt.rules).expect("TODO");
-    let rules: Rules = toml::from_slice(&rules_toml).unwrap();
-    let rules = Arc::new(RwLock::new(rules));
+    let rules = Rules::new(opt.rules.as_path(), req_rules_rx, req_ui_tx).expect("TODO");
 
     let addr = config.inbound_server_address.clone();
 
@@ -498,13 +497,12 @@ fn main() -> glib::ExitCode {
 
     let local = task::LocalSet::new();
 
-    let (req_tx, req_rx) = async_channel::bounded::<UiRequest>(16);
     let setup = Setup {
         ssh_server: Arc::new(config_ssh_server),
         ssh_client: Arc::new(config_ssh_client),
         outbound_client_key,
         request_timeout: Duration::from_secs(5),
-        req_tx,
+        req_rules_tx,
     };
 
     // Proxy server main loop
@@ -514,9 +512,8 @@ fn main() -> glib::ExitCode {
             match listener.accept().await {
                 Ok((socket, _client_addr)) => {
                     let setup = setup.clone();
-                    let rules = rules.clone();
                     task::spawn(async move {
-                        match serve_socks5(socket, setup, rules).await {
+                        match serve_socks5(socket, setup).await {
                             Ok(()) => {}
                             Err(err) => error!("{:#}", &err),
                         }
@@ -528,15 +525,13 @@ fn main() -> glib::ExitCode {
             }
         }
     });
+    // Rules actor main loop
+    runtime().spawn(async move { rules.run().await });
 
-    main_ui(req_rx)
+    main_ui(req_ui_rx)
 }
 
-async fn serve_socks5(
-    socket: tokio::net::TcpStream,
-    setup: Setup,
-    rules: Arc<RwLock<Rules>>,
-) -> Result<(), SocksError> {
+async fn serve_socks5(socket: tokio::net::TcpStream, setup: Setup) -> Result<(), SocksError> {
     let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket)
         .await?
         .read_command()
@@ -546,7 +541,7 @@ async fn serve_socks5(
     match cmd {
         Socks5Command::TCPConnect => {
             // TODO: Duration from config
-            run_tcp_proxy(proto, target_addr, setup, rules).await?;
+            run_tcp_proxy(proto, target_addr, setup).await?;
         }
         _ => {
             proto.reply_error(&ReplyError::CommandNotSupported).await?;
@@ -578,7 +573,6 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     proto: Socks5ServerProtocol<T, states::CommandRead>,
     target_addr: TargetAddr,
     setup: Setup,
-    rules: Arc<RwLock<Rules>>,
     // nodelay: bool,
 ) -> Result<(), SocksServerError> {
     let addrs = match &target_addr {
@@ -627,8 +621,7 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let handler = Handler(Arc::new(SessionState::new(
         target_addr,
         setup.outbound_client_key,
-        rules,
-        setup.req_tx,
+        setup.req_rules_tx,
     )));
     let outbound_session =
         match russh::client::connect_stream(setup.ssh_client, outbound_stream, handler.clone())

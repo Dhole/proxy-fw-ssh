@@ -1,16 +1,21 @@
 use crate::model::Permission;
-use crate::ui::messages::{ReplyPermission, RequestPermission, UiRequest};
+use crate::ui::messages::{ReplyPermission, RequestPermission, RequestUi};
 use async_channel::{Receiver, Sender};
 use gtk4::{
     self as gtk, glib, prelude::*, Align, Application, ApplicationWindow, Button, Justification,
     Label,
 };
 use std::{cell::RefCell, rc::Rc, sync::OnceLock};
+use tokio::sync::oneshot;
 
 pub mod messages;
 
-fn win_req_permission(win: &ApplicationWindow, r: RequestPermission) {
-    let reply_tx = Rc::new(RefCell::new(Some(r.reply_tx)));
+fn win_req_permission(
+    win: &ApplicationWindow,
+    req: RequestPermission,
+    reply_tx: oneshot::Sender<ReplyPermission>,
+) {
+    let reply_tx = Rc::new(RefCell::new(Some(reply_tx)));
     win.connect_close_request({
         let reply_tx = reply_tx.clone();
         move |w| {
@@ -40,7 +45,7 @@ fn win_req_permission(win: &ApplicationWindow, r: RequestPermission) {
     let label = Label::builder().justify(Justification::Center).build();
     label.set_markup(&format!(
         concat!("Allow\n", "<b>{}</b>\n", "to {}?"),
-        r.pk_openssh, r.action
+        req.pk_openssh, req.action
     ));
 
     let btn_allow = Button::builder().label("Allow always").build();
@@ -96,7 +101,7 @@ fn win_req_permission(win: &ApplicationWindow, r: RequestPermission) {
     grid.attach(&btn_deny, 2, 1, 1, 1);
 }
 
-pub fn main_ui(req_rx: Receiver<UiRequest>) -> glib::ExitCode {
+pub fn main_ui(req_rx: Receiver<RequestUi>) -> glib::ExitCode {
     let app = Application::builder().build();
     // Keep the "app" running even if there are no GTK windows
     let _app_hold = app.hold();
@@ -125,8 +130,8 @@ pub fn main_ui(req_rx: Receiver<UiRequest>) -> glib::ExitCode {
                         .default_height(32)
                         .build();
                     match req {
-                        UiRequest::Permission(r) => {
-                            win_req_permission(&win, r);
+                        RequestUi::Permission(req, reply_tx) => {
+                            win_req_permission(&win, req, reply_tx);
                         }
                     }
 
