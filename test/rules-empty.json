@@ -1,0 +1,15 @@
+{
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBCGr1EFxkyH9ncK0k2Db42XvdA9sNdpOpu4JULknGKm": {
+    "name": "test-1",
+    "servers": {
+      "127.0.0.1:2222": {
+        "git": {
+          "/git/test1.git": {
+            "read": "ask",
+            "write": "yes"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,9 +1,11 @@
 use crate::model::Permission;
-use crate::ui::messages::{ReplyPermission, RequestPermission, RequestUi};
+use crate::ui::messages::{
+    ReplyClientName, ReplyPermission, RequestClientName, RequestPermission, RequestUi,
+};
 use async_channel::{Receiver, Sender};
 use gtk4::{
-    self as gtk, glib, prelude::*, Align, Application, ApplicationWindow, Button, Justification,
-    Label,
+    self as gtk, glib, prelude::*, Align, Application, ApplicationWindow, Button, Entry,
+    Justification, Label,
 };
 use std::{cell::RefCell, rc::Rc, sync::OnceLock};
 use tokio::sync::oneshot;
@@ -101,6 +103,76 @@ fn win_req_permission(
     grid.attach(&btn_deny, 2, 1, 1, 1);
 }
 
+fn win_req_client_name(
+    win: &ApplicationWindow,
+    req: RequestClientName,
+    reply_tx: oneshot::Sender<ReplyClientName>,
+) {
+    let reply_tx = Rc::new(RefCell::new(Some(reply_tx)));
+    win.connect_close_request({
+        let reply_tx = reply_tx.clone();
+        move |w| {
+            println!("DBG close request");
+            if let Some(tx) = reply_tx.take() {
+                tx.send(ReplyClientName { name: None }).expect("send once");
+            }
+            w.set_visible(false);
+            glib::Propagation::Stop
+        }
+    });
+    let grid = gtk::Grid::builder()
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .row_spacing(6)
+        .column_spacing(6)
+        .build();
+    win.set_child(Some(&grid));
+    let label = Label::builder().justify(Justification::Center).build();
+    label.set_markup(&format!(
+        concat!("New client with key\n", "<b>{}</b>\n"),
+        req.pk_openssh
+    ));
+
+    let label_name = Label::builder().label("Name:").build();
+    let text_name = Entry::builder().build();
+    let btn_save = Button::builder().label("Save").build();
+    btn_save.set_sensitive(false);
+
+    text_name.connect_changed({
+        let btn_save = btn_save.clone();
+        move |text| {
+            if text.text_length() == 0 {
+                btn_save.set_sensitive(false);
+            } else {
+                btn_save.set_sensitive(true);
+            }
+        }
+    });
+    btn_save.connect_clicked({
+        let win = win.clone();
+        let text_name = text_name.clone();
+        let reply_tx = reply_tx.clone();
+        move |button| {
+            println!("DBG save");
+            let tx = reply_tx.take().expect("first take");
+            tx.send(ReplyClientName {
+                name: Some(text_name.text().to_string()),
+            })
+            .expect("send once");
+            win.close();
+        }
+    });
+
+    grid.attach(&label, 0, 0, 3, 1);
+    grid.attach(&label_name, 0, 1, 1, 1);
+    grid.attach(&text_name, 1, 1, 1, 1);
+    grid.attach(&btn_save, 2, 1, 1, 1);
+}
+
 pub fn main_ui(req_rx: Receiver<RequestUi>) -> glib::ExitCode {
     let app = Application::builder().build();
     // Keep the "app" running even if there are no GTK windows
@@ -131,7 +203,10 @@ pub fn main_ui(req_rx: Receiver<RequestUi>) -> glib::ExitCode {
                         .build();
                     match req {
                         RequestUi::Permission(req, reply_tx) => {
-                            win_req_permission(&win, req, reply_tx);
+                            win_req_permission(&win, req, reply_tx)
+                        }
+                        RequestUi::ClientName(req, reply_tx) => {
+                            win_req_client_name(&win, req, reply_tx)
                         }
                     }
 

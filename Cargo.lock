@@ -2497,6 +2497,7 @@ dependencies = [
  "rand",
  "russh",
  "serde",
+ "serde_json",
  "shellexpand",
  "shlex",
  "structopt",

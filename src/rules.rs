@@ -1,29 +1,19 @@
 use std::collections::HashMap;
 use std::fs;
+use std::hash::Hash;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::model::Permission;
-use crate::ui::messages::{ReplyPermission, RequestPermission, RequestUi};
+use crate::ui::messages::{
+    ReplyClientName, ReplyPermission, RequestClientName, RequestPermission, RequestUi,
+};
 use anyhow::{anyhow, bail, Context, Error, Result};
 use async_channel::{Receiver, Sender};
+use log::error;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-
-// pub struct RequestUiHandler<'a> {
-//     pub pk_openssh: &'a str,
-//     pub tx: &'a Sender<RequestUi>,
-// }
-//
-// impl<'a> RequestUiHandler<'a> {
-//     async fn request(self, action: String) -> ReplyPermission {
-//         let req = RequestPermission {
-//             pk_openssh: self.pk_openssh.to_string(),
-//             action,
-//         };
-//         req.request(self.tx).await
-//     }
-// }
 
 pub enum RequestRules {
     Exec(RequestRulesExec, oneshot::Sender<Result<()>>),
@@ -57,14 +47,32 @@ impl Rules {
         req_rx: Receiver<RequestRules>,
         req_ui_tx: Sender<RequestUi>,
     ) -> Result<Self> {
-        let rules_toml = fs::read(file_path)?;
-        let clients: HashMap<String, ClientRules> = toml::from_slice(&rules_toml)?;
+        let clients: HashMap<String, ClientRules> = match fs::read(file_path) {
+            Err(e) if e.kind() == ErrorKind::NotFound => HashMap::new(),
+            Err(e) => return Err(e.into()),
+            Ok(rules_json) => serde_json::from_slice(&rules_json)?,
+        };
         Ok(Self {
             clients,
             file_path: file_path.to_path_buf(),
             req_rx,
             req_ui_tx,
         })
+    }
+
+    fn _save(&self) -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&self.file_path)?;
+        serde_json::to_writer_pretty(&mut file, &self.clients)?;
+        Ok(())
+    }
+    fn save(&self) {
+        if let Err(e) = self._save() {
+            error!("fatal: failed to save rules: {e}");
+            std::process::exit(1);
+        }
     }
 
     pub async fn run(mut self) {
@@ -80,19 +88,31 @@ impl Rules {
 
     async fn handle_req_exec(&mut self, req: RequestRulesExec) -> Result<()> {
         let mut updated = false;
-        let mut client_rules = match self.clients.get_mut(&req.pk_openssh) {
+        let client_rules = match self.clients.get_mut(&req.pk_openssh) {
             Some(rules) => rules,
             None => {
-                // TODO: New client, ui request to give it a name and save it
                 updated = true;
-                todo!()
+                let ReplyClientName { name } = (RequestClientName {
+                    pk_openssh: req.pk_openssh.clone(),
+                })
+                .request(&self.req_ui_tx)
+                .await;
+                if let Some(name) = name {
+                    self.clients
+                        .insert(req.pk_openssh.clone(), ClientRules::new(name));
+                    self.clients
+                        .get_mut(&req.pk_openssh)
+                        .expect("just inserted")
+                } else {
+                    bail!("no client name set");
+                }
             }
         };
         let res = client_rules
             .validate_exec(&mut updated, &self.req_ui_tx, &req)
             .await;
         if updated {
-            todo!("update");
+            self.save();
         }
         res
     }
@@ -100,19 +120,33 @@ impl Rules {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ClientRules {
-    name: Option<String>,
+    name: String,
     servers: HashMap<String, ServerRules>,
 }
 
 impl ClientRules {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            servers: HashMap::new(),
+        }
+    }
     pub async fn validate_exec(
         &mut self,
         updated: &mut bool,
         req_ui_tx: &Sender<RequestUi>,
         req: &RequestRulesExec,
     ) -> Result<()> {
-        let Some(server_rules) = self.servers.get(&req.server_addr) else {
-            bail!("TODO: server {} not in rules", &req.server_addr);
+        let server_rules = match self.servers.get_mut(&req.server_addr) {
+            Some(server_rules) => server_rules,
+            None => {
+                *updated = true;
+                self.servers
+                    .insert(req.server_addr.clone(), ServerRules::default());
+                self.servers
+                    .get_mut(&req.server_addr)
+                    .expect("just inserted")
+            }
         };
         if GitRules::matches_exec(&req.user, &req.data) {
             return server_rules
@@ -129,12 +163,12 @@ impl ClientRules {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ServerRules {
     git: GitRules,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct GitRules {
     #[serde(flatten)]
     paths: HashMap<String, GitAccessRule>,
@@ -146,7 +180,7 @@ impl GitRules {
             && (data.starts_with("git-upload-pack") || data.starts_with("git-receive-pack"))
     }
     async fn validate_exec(
-        &self,
+        &mut self,
         updated: &mut bool,
         req_ui_tx: &Sender<RequestUi>,
         req: &RequestRulesExec,
@@ -160,7 +194,14 @@ impl GitRules {
         let Some(arg1) = args.get(1) else {
             bail!("missing arg1");
         };
-        let access_rule = self.paths.get(arg1).cloned().unwrap_or_default();
+        let access_rule = match self.paths.get_mut(arg1) {
+            Some(access_rule) => access_rule,
+            None => {
+                *updated = true;
+                self.paths.insert(arg1.clone(), GitAccessRule::default());
+                self.paths.get_mut(arg1).expect("just inserted")
+            }
+        };
         match arg0.as_str() {
             "git-upload-pack" => match access_rule.read {
                 Permission::Yes => Ok(()),
@@ -172,12 +213,15 @@ impl GitRules {
                     }
                     .request(req_ui_tx)
                     .await;
+                    if !matches!(future, Permission::Ask) {
+                        *updated = true;
+                        access_rule.read = future;
+                    }
                     if now {
                         Ok(())
                     } else {
                         Err(anyhow!("interactively denied"))
                     }
-                    // TODO: update rules with future
                 }
             },
             "git-receive-pack" => match access_rule.write {
@@ -190,12 +234,15 @@ impl GitRules {
                     }
                     .request(req_ui_tx)
                     .await;
+                    if !matches!(future, Permission::Ask) {
+                        *updated = true;
+                        access_rule.write = future;
+                    }
                     if now {
                         Ok(())
                     } else {
                         Err(anyhow!("interactively denied"))
                     }
-                    // TODO: update rules with future
                 }
             },
             _ => Err(anyhow!("invalid command {}", arg0)),
@@ -207,13 +254,4 @@ impl GitRules {
 struct GitAccessRule {
     read: Permission,
     write: Permission,
-}
-
-impl GitAccessRule {
-    fn read(&self) -> bool {
-        matches!(self.read, Permission::Yes)
-    }
-    fn write(&self) -> bool {
-        matches!(self.write, Permission::Yes)
-    }
 }
