@@ -43,18 +43,18 @@ pub struct Rules {
 
 impl Rules {
     pub fn new(
-        file_path: &Path,
+        file_path: impl AsRef<Path>,
         req_rx: Receiver<RequestRules>,
         req_ui_tx: Sender<RequestUi>,
     ) -> Result<Self> {
-        let clients: HashMap<String, ClientRules> = match fs::read(file_path) {
+        let clients: HashMap<String, ClientRules> = match fs::read(file_path.as_ref()) {
             Err(e) if e.kind() == ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e.into()),
             Ok(rules_json) => serde_json::from_slice(&rules_json)?,
         };
         Ok(Self {
             clients,
-            file_path: file_path.to_path_buf(),
+            file_path: file_path.as_ref().to_path_buf(),
             req_rx,
             req_ui_tx,
         })

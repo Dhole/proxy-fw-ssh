@@ -61,6 +61,8 @@ struct Config {
     inbound_server_address: String,
     inbound_server_identity_file: String,
     outbound_client_identity_file: String,
+    known_hosts_file: String,
+    rules_file: String,
 }
 
 #[derive(Clone)]
@@ -444,12 +446,6 @@ impl server::Handler for Handler {
 struct Opt {
     #[structopt(short = "c", long)]
     pub config: PathBuf,
-
-    #[structopt(short = "r", long)]
-    pub rules: PathBuf,
-
-    #[structopt(short = "k", long)]
-    pub known_hosts: PathBuf,
 }
 
 use tokio::runtime::Runtime;
@@ -469,9 +465,11 @@ fn main() -> glib::ExitCode {
     let opt = Opt::from_args();
     let config_toml = fs::read(opt.config).expect("TODO");
     let config: Config = toml::from_slice(&config_toml).unwrap();
-    let rules = Rules::new(opt.rules.as_path(), req_rules_rx, req_ui_tx.clone()).expect("TODO");
+    let rules_file = shellexpand::tilde(&config.rules_file);
+    let rules = Rules::new(rules_file.as_ref(), req_rules_rx, req_ui_tx.clone()).expect("TODO");
+    let known_hosts_file = shellexpand::tilde(&config.known_hosts_file);
     let known_hosts =
-        KnownHosts::new(opt.known_hosts.as_path(), req_known_hosts_rx, req_ui_tx).expect("TODO");
+        KnownHosts::new(known_hosts_file.as_ref(), req_known_hosts_rx, req_ui_tx).expect("TODO");
 
     let addr = config.inbound_server_address.clone();
 

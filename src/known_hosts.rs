@@ -96,14 +96,14 @@ impl KnownHosts {
         }
     }
     pub fn new(
-        file_path: &Path,
+        file_path: impl AsRef<Path>,
         req_rx: Receiver<RequestKnownHosts>,
         req_ui_tx: Sender<RequestUi>,
     ) -> Result<Self> {
-        let hosts = Self::read(file_path)?;
+        let hosts = Self::read(file_path.as_ref())?;
         Ok(Self {
             hosts,
-            file_path: file_path.to_path_buf(),
+            file_path: file_path.as_ref().to_path_buf(),
             req_rx,
             req_ui_tx,
         })

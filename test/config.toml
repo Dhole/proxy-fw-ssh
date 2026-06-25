@@ -1,3 +1,5 @@
 inbound_server_address = "0.0.0.0:2324"
 inbound_server_identity_file = "~/git/proxy-fw-ssh/test/id_ed25519_inbound_server"
 outbound_client_identity_file = "~/git/proxy-fw-ssh/test/id_ed25519_outbound_client"
+known_hosts_file = "~/git/proxy-fw-ssh/test/known_hosts"
+rules_file = "~/git/proxy-fw-ssh/test/rules.json"
