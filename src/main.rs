@@ -17,7 +17,7 @@ use std::{
 use std::{cell::Cell, io, os::fd::AsRawFd as _};
 
 use async_channel::{Receiver, Sender};
-use dashmap::{mapref::one::Ref, DashMap};
+use dashmap::{mapref::multiple::RefMulti, mapref::one::Ref, DashMap};
 use fast_socks5::{
     server::{states, ErrorContext, Socks5ServerProtocol, SocksServerError},
     util::{
@@ -45,11 +45,13 @@ use tokio::{
     time::sleep,
 };
 
+pub mod known_hosts;
 pub mod model;
 pub mod rules;
 pub mod ui;
 
 use crate::model::Permission;
+use known_hosts::{KnownHosts, RequestKnownHost, RequestKnownHosts};
 use rules::{RequestRules, RequestRulesExec, Rules};
 use ui::main_ui;
 use ui::messages::{ReplyPermission, RequestUi};
@@ -68,6 +70,7 @@ struct Setup {
     outbound_client_key: PrivateKey,
     request_timeout: Duration,
     req_rules_tx: Sender<RequestRules>,
+    req_known_hosts_tx: Sender<RequestKnownHosts>,
 }
 
 struct SessionState {
@@ -85,6 +88,7 @@ struct SessionState {
     // Actors
     //
     req_rules_tx: Sender<RequestRules>,
+    req_known_hosts_tx: Sender<RequestKnownHosts>,
     //
     // Dynamic
     //
@@ -108,6 +112,7 @@ impl SessionState {
         outbound_server_addr: TargetAddr,
         outbound_client_key: PrivateKey,
         req_rules_tx: Sender<RequestRules>,
+        req_known_hosts_tx: Sender<RequestKnownHosts>,
     ) -> Self {
         Self {
             outbound_server_addr,
@@ -116,7 +121,8 @@ impl SessionState {
             inbound_client_pk_openssh: SetOnce::new(),
             outbound_session: SetOnce::new(),
             inbound_session: SetOnce::new(),
-            req_rules_tx: req_rules_tx,
+            req_rules_tx,
+            req_known_hosts_tx,
             outbound_inbound_chan_id_map: DashMap::new(),
             inbound_outbound_chan_map: DashMap::new(),
         }
@@ -193,10 +199,25 @@ impl client::Handler for Handler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // TODO: TOFU like OpenSSH
-        Ok(true)
+        debug!(
+            "DBG check_server_key {}",
+            server_public_key.to_openssh().unwrap()
+        );
+        match (RequestKnownHost {
+            host: format!("{}", self.outbound_server_addr),
+            key: server_public_key.clone(),
+        })
+        .request(&self.req_known_hosts_tx)
+        .await
+        {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                error!("server key rejected: {e}");
+                Ok(false)
+            }
+        }
     }
 
     #[allow(unused_variables)]
@@ -343,10 +364,13 @@ impl server::Handler for Handler {
             .await?;
 
         if !auth_res.success() {
-            panic!("Authentication (with publickey) failed");
-        } else {
-            debug!("Authentication success");
-        }
+            error!("Outbound authentication (with publickey) failed");
+            return Ok(server::Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        };
+        debug!("Authentication success");
         self.set_inbound_client_auth(user.to_string(), key.clone());
         Ok(server::Auth::Accept)
     }
@@ -386,17 +410,15 @@ impl server::Handler for Handler {
         .request(&self.req_rules_tx)
         .await
         {
-            Ok(()) => info!("approved exec"),
-
             Err(e) => {
-                info!("denied exec: {}", e);
-                panic!("TODO");
+                error!("denied exec: {}", e);
+                session.channel_failure(channel)?;
+                return Ok(());
             }
+            Ok(()) => info!("approved exec"),
         }
-        // TODO: Allow or deny based on config
         let outbound_channel = self.outbound_chan(channel);
         outbound_channel.exec(true, data).await?;
-        // TODO: sync with client channel success/failure
         session.channel_success(channel)?;
         Ok(())
     }
@@ -425,6 +447,9 @@ struct Opt {
 
     #[structopt(short = "r", long)]
     pub rules: PathBuf,
+
+    #[structopt(short = "k", long)]
+    pub known_hosts: PathBuf,
 }
 
 use tokio::runtime::Runtime;
@@ -439,11 +464,14 @@ fn main() -> glib::ExitCode {
 
     let (req_ui_tx, req_ui_rx) = async_channel::bounded::<RequestUi>(16);
     let (req_rules_tx, req_rules_rx) = async_channel::bounded::<RequestRules>(16);
+    let (req_known_hosts_tx, req_known_hosts_rx) = async_channel::bounded::<RequestKnownHosts>(16);
 
     let opt = Opt::from_args();
     let config_toml = fs::read(opt.config).expect("TODO");
     let config: Config = toml::from_slice(&config_toml).unwrap();
-    let rules = Rules::new(opt.rules.as_path(), req_rules_rx, req_ui_tx).expect("TODO");
+    let rules = Rules::new(opt.rules.as_path(), req_rules_rx, req_ui_tx.clone()).expect("TODO");
+    let known_hosts =
+        KnownHosts::new(opt.known_hosts.as_path(), req_known_hosts_rx, req_ui_tx).expect("TODO");
 
     let addr = config.inbound_server_address.clone();
 
@@ -503,6 +531,7 @@ fn main() -> glib::ExitCode {
         outbound_client_key,
         request_timeout: Duration::from_secs(5),
         req_rules_tx,
+        req_known_hosts_tx,
     };
 
     // Proxy server main loop
@@ -527,6 +556,8 @@ fn main() -> glib::ExitCode {
     });
     // Rules actor main loop
     runtime().spawn(async move { rules.run().await });
+    // KnownHosts actor main loop
+    runtime().spawn(async move { known_hosts.run().await });
 
     main_ui(req_ui_rx)
 }
@@ -622,6 +653,7 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         target_addr,
         setup.outbound_client_key,
         setup.req_rules_tx,
+        setup.req_known_hosts_tx,
     )));
     let outbound_session =
         match russh::client::connect_stream(setup.ssh_client, outbound_stream, handler.clone())
@@ -652,7 +684,7 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tokio::select! {
         result = inbound_session => {
             if let Err(e) = result {
-                panic!("Connection closed with error: {}", e);
+                info!("Connection closed with error: {}", e);
             } else {
                 debug!("Connection closed");
             }
@@ -660,6 +692,11 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
     // russh doesn't expose the (reason, description, language_tag) of a client disconnect, so we
     // can't propagate those values when we disconnect the outbound session.
+    for ref_multi in handler.inbound_outbound_chan_map.iter() {
+        let outbound_channel = ref_multi.value();
+        outbound_channel.eof().await.unwrap();
+        outbound_channel.close().await.unwrap();
+    }
     handler
         .outbound_handle()
         .await

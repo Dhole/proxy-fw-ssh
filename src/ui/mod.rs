@@ -1,12 +1,14 @@
 use crate::model::Permission;
 use crate::ui::messages::{
-    ReplyClientName, ReplyPermission, RequestClientName, RequestPermission, RequestUi,
+    ReplyAcceptKey, ReplyClientName, ReplyPermission, RequestAcceptKey, RequestClientName,
+    RequestPermission, RequestUi,
 };
 use async_channel::{Receiver, Sender};
 use gtk4::{
     self as gtk, glib, prelude::*, Align, Application, ApplicationWindow, Button, Entry,
     Justification, Label,
 };
+use log::debug;
 use std::{cell::RefCell, rc::Rc, sync::OnceLock};
 use tokio::sync::oneshot;
 
@@ -21,7 +23,7 @@ fn win_req_permission(
     win.connect_close_request({
         let reply_tx = reply_tx.clone();
         move |w| {
-            println!("DBG close request");
+            debug!("win.close_request");
             if let Some(tx) = reply_tx.take() {
                 tx.send(ReplyPermission {
                     now: false,
@@ -58,7 +60,6 @@ fn win_req_permission(
         let win = win.clone();
         let reply_tx = reply_tx.clone();
         move |button| {
-            println!("DBG allow always");
             let tx = reply_tx.take().expect("first take");
             tx.send(ReplyPermission {
                 now: true,
@@ -72,7 +73,6 @@ fn win_req_permission(
         let win = win.clone();
         let reply_tx = reply_tx.clone();
         move |button| {
-            println!("DBG allow once");
             let tx = reply_tx.take().expect("first take");
             tx.send(ReplyPermission {
                 now: true,
@@ -86,7 +86,6 @@ fn win_req_permission(
         let win = win.clone();
         let reply_tx = reply_tx.clone();
         move |button| {
-            println!("DBG deny always");
             let tx = reply_tx.take().expect("first take");
             tx.send(ReplyPermission {
                 now: false,
@@ -112,7 +111,6 @@ fn win_req_client_name(
     win.connect_close_request({
         let reply_tx = reply_tx.clone();
         move |w| {
-            println!("DBG close request");
             if let Some(tx) = reply_tx.take() {
                 tx.send(ReplyClientName { name: None }).expect("send once");
             }
@@ -157,7 +155,6 @@ fn win_req_client_name(
         let text_name = text_name.clone();
         let reply_tx = reply_tx.clone();
         move |button| {
-            println!("DBG save");
             let tx = reply_tx.take().expect("first take");
             tx.send(ReplyClientName {
                 name: Some(text_name.text().to_string()),
@@ -173,6 +170,75 @@ fn win_req_client_name(
     grid.attach(&btn_save, 2, 1, 1, 1);
 }
 
+fn win_req_accept_key(
+    win: &ApplicationWindow,
+    req: RequestAcceptKey,
+    reply_tx: oneshot::Sender<ReplyAcceptKey>,
+) {
+    let reply_tx = Rc::new(RefCell::new(Some(reply_tx)));
+    win.connect_close_request({
+        let reply_tx = reply_tx.clone();
+        move |w| {
+            debug!("win.close_request");
+            if let Some(tx) = reply_tx.take() {
+                tx.send(ReplyAcceptKey { accept: false })
+                    .expect("send once");
+            }
+            w.set_visible(false);
+            glib::Propagation::Stop
+        }
+    });
+    let grid = gtk::Grid::builder()
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .row_spacing(6)
+        .column_spacing(6)
+        .build();
+    win.set_child(Some(&grid));
+    let label = Label::builder().justify(Justification::Center).build();
+    label.set_markup(&format!(
+        concat!(
+            "Accept connection to host\n",
+            "<b>{}</b>\n",
+            "with key fingerprint\n",
+            "<b>{}</b>?"
+        ),
+        req.host,
+        req.key.fingerprint(ssh_key::HashAlg::Sha256)
+    ));
+
+    let btn_yes = Button::builder().label("Yes").build();
+    let btn_no = Button::builder().label("No").build();
+
+    btn_yes.connect_clicked({
+        let win = win.clone();
+        let reply_tx = reply_tx.clone();
+        move |button| {
+            let tx = reply_tx.take().expect("first take");
+            tx.send(ReplyAcceptKey { accept: true }).expect("send once");
+            win.close();
+        }
+    });
+    btn_no.connect_clicked({
+        let win = win.clone();
+        let reply_tx = reply_tx.clone();
+        move |button| {
+            let tx = reply_tx.take().expect("first take");
+            tx.send(ReplyAcceptKey { accept: false })
+                .expect("send once");
+            win.close();
+        }
+    });
+
+    grid.attach(&label, 0, 0, 2, 1);
+    grid.attach(&btn_yes, 0, 1, 1, 1);
+    grid.attach(&btn_no, 1, 1, 1, 1);
+}
+
 pub fn main_ui(req_rx: Receiver<RequestUi>) -> glib::ExitCode {
     let app = Application::builder().build();
     // Keep the "app" running even if there are no GTK windows
@@ -180,19 +246,13 @@ pub fn main_ui(req_rx: Receiver<RequestUi>) -> glib::ExitCode {
 
     let req_rx = Rc::new(RefCell::new(Some(req_rx)));
     app.connect_startup({
-        // let window_slot = window_slot.clone();
-        // let win = win.clone();
-        // let wake_rx = wake_rx;
         let app = app.clone();
         move |_| {
-            println!("DBG connect_startup");
-            // let window_slot = window_slot.clone();
-            // let win = win.clone();
+            debug!("app.connect_startup");
 
             let app = app.clone();
             // Receive wakeups on the GTK main loop via glib::spawn_future_local
             let req_rx = req_rx.take().unwrap();
-            // let wake_rx = wake_rx.clone();
             glib::spawn_future_local(async move {
                 while let Ok(req) = req_rx.recv().await {
                     let win = ApplicationWindow::builder()
@@ -208,6 +268,9 @@ pub fn main_ui(req_rx: Receiver<RequestUi>) -> glib::ExitCode {
                         RequestUi::ClientName(req, reply_tx) => {
                             win_req_client_name(&win, req, reply_tx)
                         }
+                        RequestUi::AcceptKey(req, reply_tx) => {
+                            win_req_accept_key(&win, req, reply_tx)
+                        }
                     }
 
                     win.present();
@@ -217,8 +280,7 @@ pub fn main_ui(req_rx: Receiver<RequestUi>) -> glib::ExitCode {
     });
 
     app.connect_activate(move |_| {
-        println!("DBG connect_activate");
-        // win.present();
+        debug!("app.connect_activate");
     });
 
     app.run_with_args::<glib::GString>(&[])

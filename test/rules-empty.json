@@ -6,7 +6,7 @@
         "git": {
           "/git/test1.git": {
             "read": "ask",
-            "write": "yes"
+            "write": "no"
           }
         }
       }
